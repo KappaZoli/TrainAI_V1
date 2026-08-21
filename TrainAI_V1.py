@@ -43,52 +43,63 @@ class TMAIClient(Client):
             self.finished = True
 
     def on_run_step(self, iface: TMInterface, _time: int):
-        state = iface.get_simulation_state()
-        
-        # --- 1. RÉGI ÉS ÚJ ADATOK KIOLVASÁSA ---
-        speed = state.display_speed
-        yaw, pitch, roll = state.yaw_pitch_roll
-        vel_x, vel_y, vel_z = state.velocity # ÚJ: A 3D-s sebességvektorok
-        gear = state.gear # ÚJ: Sebességfokozat (1-5)
-        
-        # --- 2. POSTAFIÓK KIBŐVÍTÉSE ---
-        if _time >= 0:
-            if state_q.full():
-                try: state_q.get_nowait()
-                except: pass
-            # Belerakjuk az új adatokat is! (Figyelj, hogy a env.step-ben és reset-ben is így olvasd ki!)
-            state_q.put((speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, self.finished, self.current_cp))
-        
-        # --- 3. AKCIÓK FOGADÁSA ---
         try:
+            state = iface.get_simulation_state()
+            
+            # --- NYOMOZÓ MÓD: Kiíratjuk az összes létező változót a state-ből! ---
+            if _time == 0: # Csak a legelső képkockánál írjuk ki, hogy ne spammelje tele a konzolt
+                print("\n>>> ELÉRHETŐ STATE VÁLTOZÓK: <<<")
+                print(dir(state))
+                print("==================================\n")
+            
+            # 1. Alap adatok
+            speed = state.display_speed
+            yaw, pitch, roll = state.yaw_pitch_roll
+            vel_x, vel_y, vel_z = state.velocity
+            
+            # 2. A Gear okos keresése (hasattr = megnézi, hogy létezik-e az adott név)
+            if hasattr(state, 'gear'):
+                gear = state.gear
+            elif hasattr(state, 'engine_gear'):
+                gear = state.engine_gear
+            elif hasattr(state, 'scene_mobil') and hasattr(state.scene_mobil, 'gear'):
+                gear = state.scene_mobil.gear
+            else:
+                gear = 1.0 # Vészmegoldás, hogy ne fagyjon le a játék, amíg meg nem találjuk!
+
+            # 3. Postafiók (8 adat + 2 jelző)
             if _time >= 0:
-                action = action_q.get(timeout=1.0) 
-            else:
-                action = action_q.get_nowait()
-        except queue.Empty:
-            action = None
+                if state_q.full():
+                    try: state_q.get_nowait()
+                    except: pass
+                state_q.put((speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, self.finished, self.current_cp))
             
-        # --- 4. PARANCSOK VÉGREHAJTÁSA (KORMÁNY, GÁZ, FÉK) ---
-        if action == "RESET":
-            iface.execute_command("press delete")
-            self.finished = False
-            self.current_cp = 0 
-        elif action is not None and _time >= 0:
-            # 1. Kormányzás (action[0])
-            steer_val = int(action[0] * 65536)
-            iface.execute_command(f"steer {steer_val}")
-            
-            # 2. Gáz (action[1]): Ha az érték > 0, nyomja a gázt!
-            if action[1] > 0.0:
-                iface.execute_command("gas 1")
-            else:
-                iface.execute_command("gas 0")
+            # --- AKCIÓK ---
+            try:
+                if _time >= 0:
+                    action = action_q.get(timeout=1.0) 
+                else:
+                    action = action_q.get_nowait()
+            except queue.Empty:
+                action = None
                 
-            # 3. Fék (action[2]): Ha az érték > 0, nyomja a féket!
-            if action[2] > 0.0:
-                iface.execute_command("brake 1")
-            else:
-                iface.execute_command("brake 0")
+            # --- VÉGREHAJTÁS ---
+            if isinstance(action, str) and action == "RESET":
+                iface.execute_command("press delete")
+                self.finished = False
+                self.current_cp = 0 
+            elif action is not None and _time >= 0:
+                steer_val = int(action[0] * 65536)
+                iface.execute_command(f"steer {steer_val}")
+                
+                if action[1] > 0.0: iface.execute_command("gas 1")
+                else: iface.execute_command("gas 0")
+                    
+                if action[2] > 0.0: iface.execute_command("brake 1")
+                else: iface.execute_command("brake 0")
+                    
+        except Exception as e:
+            print(f"--- VÉGZETES HIBA A JÁTÉK SZÁLBAN: {e} ---")
 
 # ==========================================
 # 2. RÉSZ: AZ AI KÖRNYEZETE (Az Aréna)
