@@ -19,7 +19,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 state_q = queue.Queue(maxsize=1)
 action_q = queue.Queue(maxsize=1)
 
-torch.set_num_threads(6) # Beállítja, hogy a Ryzen 5 7600 mind a 6 magját használja az AI agyának számításaihoz!
+torch.set_num_threads(4) # Beállítja, hogy a Ryzen 5 7600 mind a 6 magját használja az AI agyának számításaihoz!
 # ==========================================
 # 1. RÉSZ: A JÁTÉK MOTORJA (A Test)
 # ==========================================
@@ -88,18 +88,16 @@ class TMAIClient(Client):
                 steer_val = int(action[0] * 65536)
                 iface.execute_command(f"steer {steer_val}")
                 
-                # 2. GÁZ PEDÁL (Határozott nyomás)
-                # Ha az AI értéke nagyobb mint 0.1, padlógáz!
+                # 2. GÁZ ÉS FÉK PEDÁL (Közös tengelyen a Trackmaniában!)
                 if action[1] > 0.1:
-                    iface.execute_command("gas -65536") # Ha esetleg ezzel sem megy, írd át "-65536"-ra!
+                    # Gázpedál nyomva
+                    iface.execute_command("gas -65536")
+                elif action[2] > 0.1:
+                    # Fékpedál nyomva (Negatív gáz)
+                    iface.execute_command("gas 65536")
                 else:
+                    # Üresjárat (Nincs pedál lenyomva)
                     iface.execute_command("gas 0")
-                    
-                # 3. FÉK PEDÁL
-                if action[2] > 0.1:
-                    iface.execute_command("brake 65536")
-                else:
-                    iface.execute_command("brake 0")
                     
         except Exception as e:
             print(f"--- VÉGZETES HIBA A JÁTÉK SZÁLBAN: {e} ---")
@@ -126,7 +124,7 @@ class TrackmaniaEnv(gym.Env):
         self.current_step = 0
         gc.collect() 
 
-        if action_q.full():
+        while not action_q.empty():
             try: action_q.get_nowait()
             except: pass
         action_q.put("RESET")
