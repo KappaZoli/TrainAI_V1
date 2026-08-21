@@ -6,7 +6,7 @@ import torch
 import threading
 import queue
 from tkinter import END
-from turtle import distance
+from turtle import distance, pos
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -51,17 +51,21 @@ class TMAIClient(Client):
             yaw, pitch, roll = state.yaw_pitch_roll
             vel_x, vel_y, vel_z = state.velocity
             
-            # 2. A Sebességfokozat (Gear) TÖKÉLETES kiolvasása!
-            gear = 1.0 # Biztonsági alapérték
+            # --- ÚJ: A POZÍCIÓ KINYERÉSE ---
+            pos_x, pos_y, pos_z = state.position
+            
+            # 2. A Sebességfokozat (Gear) 
+            gear = 1.0 
             if hasattr(state, 'scene_mobil') and hasattr(state.scene_mobil, 'engine'):
                 gear = float(state.scene_mobil.engine.gear)
 
-            # 3. Postafiók küldése (8 adat + 2 jelző)
+            # 3. Postafiók küldése (Már 11 adat + 2 jelző!)
             if _time >= 0:
                 if state_q.full():
                     try: state_q.get_nowait()
                     except: pass
-                state_q.put((speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, self.finished, self.current_cp))
+                # Beletesszük a pos_x, pos_y, pos_z értékeket is a csomagba:
+                state_q.put((speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, self.finished, self.current_cp))
             
             # --- AKCIÓK ---
             try:
@@ -73,25 +77,24 @@ class TMAIClient(Client):
                 action = None
                 
             # --- VÉGREHAJTÁS ---
+            # --- VÉGREHAJTÁS ---
             if isinstance(action, str) and action == "RESET":
                 iface.execute_command("press delete")
                 self.finished = False
                 self.current_cp = 0 
             elif action is not None and _time >= 0:
+                # 1. Kormányzás (-65536 és 65536 között)
                 steer_val = int(action[0] * 65536)
                 iface.execute_command(f"steer {steer_val}")
                 
-                # Gáz pedál
-                if action[1] > 0.0: 
-                    iface.execute_command("gas 1")
-                else: 
-                    iface.execute_command("gas 0")
+                # 2. Analóg Gáz pedál (Ha action[1] negatív, akkor 0 gázt adunk)
+                # Így az AI tud "félgázt" is adni a kanyarokban!
+                gas_val = int(max(0.0, action[1]) * 65536)
+                iface.execute_command(f"gas {gas_val}")
                     
-                # Fék pedál
-                if action[2] > 0.0: 
-                    iface.execute_command("brake 1")
-                else: 
-                    iface.execute_command("brake 0")
+                # 3. Analóg Fék pedál
+                brake_val = int(max(0.0, action[2]) * 65536)
+                iface.execute_command(f"brake {brake_val}")
                     
         except Exception as e:
             print(f"--- VÉGZETES HIBA A JÁTÉK SZÁLBAN: {e} ---")
@@ -106,8 +109,8 @@ class TrackmaniaEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
         
         # === ÚJ OBSERVATION SPACE ===
-        # 8 darab érték: [speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
+        # Megnöveljük 11-re a bemenetek számát (hozzáadtuk a 3 koordinátát)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
         
         self.max_steps = 5000
         self.current_step = 0
@@ -123,14 +126,14 @@ class TrackmaniaEnv(gym.Env):
             except: pass
         action_q.put("RESET")
    
-        # Olvassuk ki az új, 8+2 tagú listát!
-        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, finished, current_cp = state_q.get()
+        # 1. Kibontjuk a megnövelt csomagot
+        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp = state_q.get()
         
-        self.prev_speed = speed
-        self.prev_cp = current_cp 
+        # 2. Beletesszük a 11 adatot a tömbbe, amit az AI megkap
+        obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z], dtype=np.float32)
         
-        # A 8 elemet beletesszük egy tömbbe és ezt adjuk a hálónak
-        return np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32), {}
+        # --- EZ A SOR HIÁNYZOTT! Visszaadjuk az obs-t és egy üres info szótárat ---
+        return obs, {}
 
    def step(self, action):
         self.current_step += 1
@@ -140,16 +143,16 @@ class TrackmaniaEnv(gym.Env):
             except: pass
         action_q.put(action)
         
-        # Kiolvassuk az új adatokat lépésenként
-        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, finished, current_cp = state_q.get()
-        obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32)
+       # Kiolvassuk az új adatokat lépésenként (már a pos_x, pos_y, pos_z is benne van!)
+        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp = state_q.get()
+        obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z], dtype=np.float32)
         
         # -----------------------------------------------------
         # INNENTŐL A JUTALMAZÁSI RENDSZERED (REWARD) MARAD UGYANAZ!
         # ... (Ide jön a sebesség jutalom, checkpoint bónusz, fal büntetés stb.) ...
         # -----------------------------------------------------
         
-        reward = speed 
+        reward = speed *0.1  # Sebesség jutalom
         
         steering_effort = abs(action[0])
         reward -= steering_effort * 0.05 
@@ -181,6 +184,13 @@ class TrackmaniaEnv(gym.Env):
         if abs(roll) > 1.5: 
             reward -= 500 
             terminated = True
+        
+        if pos_y <20.0:
+            reward -= 10000000
+            terminated = True
+         
+        
+        
             
         
 
@@ -193,6 +203,8 @@ class TrackmaniaEnv(gym.Env):
         if self.current_step >= self.max_steps:
             truncated = True
         
+
+
         
         return obs, reward, terminated, truncated, {}
 # ==========================================
