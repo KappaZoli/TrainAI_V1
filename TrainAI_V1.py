@@ -13,6 +13,7 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 from tminterface.client import Client
 from tminterface.interface import TMInterface
+from stable_baselines3.common.callbacks import CheckpointCallback
 
 # 1. POSTAFIÓKOK LÉTREHOZÁSA (Kommunikáció a játék és az AI között)
 state_q = queue.Queue(maxsize=1)
@@ -189,11 +190,12 @@ class TrackmaniaEnv(gym.Env):
             reward -= 10000000
             terminated = True
          
-        
-        
-            
-        
+        if gear == 0:
+            reward -= 1000
 
+        if vel_x < -2.0 or vel_y < -2.0 :
+            reward -= 1000
+            
         if finished:
             reward += 1000
             terminated = True
@@ -227,15 +229,25 @@ if __name__ == '__main__':
     env = TrackmaniaEnv()
     
     # ==========================================
-    # A) TANÍTÁS MÓD (Ezt csinálja most!)
+    # A) TANÍTÁS MÓD
     # ==========================================
     print("\n--- NEURÁLIS HÁLÓ INICIALIZÁLÁSA ---")
-    # Ha van már régi modell, folytathatjuk azt is, de most kezdjünk egy frisset:
     model = PPO("MlpPolicy", env, verbose=1)
     
-     #Emeljük meg a lépésszámot 50.000-re, hogy legyen ideje kitapasztalni a kanyart!
-    model.learn(total_timesteps=50000000) 
-    model.save("tm_ai_model")
+    # --- ÚJ: Biztonsági mentés beállítása ---
+    # Ez minden 10.000 lépés után csinál egy .zip fájlt a "models" nevű mappába!
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000, 
+        save_path='./models/',
+        name_prefix='tm_ai_model'
+    )
+    
+    
+    # Beadjuk a callback-et a learn függvénynek
+    model.learn(total_timesteps=50000000, callback=checkpoint_callback) 
+    
+    # Ha egyszer majd tényleg végez az 50 millióval, elmenti a végsőt is:
+    model.save("tm_ai_model_final")
     
     # ==========================================
     # B) ÉLES TESZT MÓD (Most ki van kapcsolva a '#' jelekkel)
