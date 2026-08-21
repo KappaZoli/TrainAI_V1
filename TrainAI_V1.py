@@ -88,14 +88,18 @@ class TMAIClient(Client):
                 steer_val = int(action[0] * 65536)
                 iface.execute_command(f"steer {steer_val}")
                 
-                # 2. Analóg Gáz pedál (Ha action[1] negatív, akkor 0 gázt adunk)
-                # Így az AI tud "félgázt" is adni a kanyarokban!
-                gas_val = int(max(0.0, action[1]) * 65536)
-                iface.execute_command(f"gas {gas_val}")
+                # 2. GÁZ PEDÁL (Határozott nyomás)
+                # Ha az AI értéke nagyobb mint 0.1, padlógáz!
+                if action[1] > 0.1:
+                    iface.execute_command("gas -65536") # Ha esetleg ezzel sem megy, írd át "-65536"-ra!
+                else:
+                    iface.execute_command("gas 0")
                     
-                # 3. Analóg Fék pedál
-                brake_val = int(max(0.0, action[2]) * 65536)
-                iface.execute_command(f"brake {brake_val}")
+                # 3. FÉK PEDÁL
+                if action[2] > 0.1:
+                    iface.execute_command("brake 65536")
+                else:
+                    iface.execute_command("brake 0")
                     
         except Exception as e:
             print(f"--- VÉGZETES HIBA A JÁTÉK SZÁLBAN: {e} ---")
@@ -113,7 +117,7 @@ class TrackmaniaEnv(gym.Env):
         # Megnöveljük 11-re a bemenetek számát (hozzáadtuk a 3 koordinátát)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
         
-        self.max_steps = 5000
+        self.max_steps = 10000
         self.current_step = 0
         self.prev_speed = 0.0
         self.prev_cp = 0 
@@ -160,41 +164,59 @@ class TrackmaniaEnv(gym.Env):
         
         if steering_effort < 0.1:
             reward += 1.0
+# -----------------------------------------------------
+        # JUTALMAZÁSI RENDSZER (REWARD) JAVÍTÁSA
+        # -----------------------------------------------------
+        
+        # 1. Alapvető sebesség jutalom (CSAK HA ELŐRE MEGY!)
+        if gear > 0:
+            reward = speed * 0.1  # Előre haladásért kap pontot
+        else:
+            reward = -50.0        # Rükvercért hatalmas folyamatos büntetés jár!
 
-        # === ÚJ: CHECKPOINT JUTALOM ===
-        # Ha a jelenlegi CP nagyobb, mint a régi, akkor haladtunk előre!
+        # 2. Kormányzás büntetése/jutalmazása
+        steering_effort = abs(action[0])
+        reward -= steering_effort * 0.05 
+        
+        # Csak akkor kap egyenes-haladás bónuszt, ha előre megy!
+        if steering_effort < 0.1 and gear > 0:
+            reward += 1.0
+
+        # === 3. CHECKPOINT JUTALOM ===
         if current_cp > self.prev_cp:
-            reward += 500.0  # Hatalmas jutalom a haladásért!
+            reward += 500.0  
             print(f"🚀 BÓNUSZ: Új checkpoint elérve! ({current_cp})")
             self.prev_cp = current_cp
 
         speed_diff = speed - self.prev_speed
         self.prev_speed = speed 
-        
         terminated = False
         
+        # 4. Falnak csapódás
         if speed_diff < -15.0:
             reward -= 1000
-            terminated = False
+            terminated = True # Javítva: Ha falnak csapódik, érjen véget a kör!
             
-        if speed < 3.0 and self.current_step > 300:
-            reward -= 100 
-            if self.current_step % 100 == 0: 
-                terminated = True
+    
                 
+        # 6. Borulás
         if abs(roll) > 1.5: 
             reward -= 500 
             terminated = True
         
-        if pos_y <20.0:
-            reward -= 10000000
+        # 7. Leesés a pályáról (Matematikailag stabil büntetés)
+        if pos_y < 20.0:
+            reward -= 1000
             terminated = True
-         
-        if gear == 0:
-            reward -= 1000
 
-        if vel_x < -2.0 or vel_y < -2.0 :
+        if  pos_z < 490:
             reward -= 1000
+            terminated = True
+            
+        # (A vel_x és vel_y büntetést teljesen töröltük, mert azok térkép-irányok!)
+        
+        # -----------------------------------------------------
+        # INNENTŐL JÖN A FINISHED RÉSZ (Az marad úgy, ahogy volt)
             
         if finished:
             reward += 1000
@@ -235,9 +257,9 @@ if __name__ == '__main__':
     model = PPO("MlpPolicy", env, verbose=1)
     
     # --- ÚJ: Biztonsági mentés beállítása ---
-    # Ez minden 10.000 lépés után csinál egy .zip fájlt a "models" nevű mappába!
+    # Ez minden 100.000 lépés után csinál egy .zip fájlt a "models" nevű mappába!
     checkpoint_callback = CheckpointCallback(
-        save_freq=10000, 
+        save_freq=100000, 
         save_path='./models/',
         name_prefix='tm_ai_model'
     )
