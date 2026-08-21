@@ -3,8 +3,6 @@ from math import fabs
 import time
 import gc
 import torch
-
-asdasd
 import threading
 import queue
 from tkinter import END
