@@ -47,9 +47,13 @@ class TMAIClient(Client):
             state = iface.get_simulation_state()
             
             # --- NYOMOZÓ MÓD: Kiíratjuk az összes létező változót a state-ből! ---
-            if _time == 0: # Csak a legelső képkockánál írjuk ki, hogy ne spammelje tele a konzolt
-                print("\n>>> ELÉRHETŐ STATE VÁLTOZÓK: <<<")
-                print(dir(state))
+            if _time == 0: 
+                print("\n>>> SCENE_MOBIL TITKAI: <<<")
+                if hasattr(state, 'scene_mobil'):
+                    print(dir(state.scene_mobil))
+                print("\n>>> DYNA TITKAI: <<<")
+                if hasattr(state, 'dyna'):
+                    print(dir(state.dyna))
                 print("==================================\n")
             
             # 1. Alap adatok
