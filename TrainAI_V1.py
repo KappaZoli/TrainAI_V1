@@ -1,6 +1,8 @@
 ﻿from asyncio.base_futures import _FINISHED
 from math import fabs
 import time
+import cv2
+import mss
 import gc
 import torch
 import threading
@@ -26,12 +28,14 @@ torch.set_num_threads(4) # Beállítja, hogy a Ryzen 5 7600 mind a 6 magját has
 class TMAIClient(Client):
     def __init__(self):
         super().__init__()
-        # ÚJ: jelző, hogy a kocsi célba ért-e ebben a körben
         self.finished = False
         self.current_cp = 0
-
-    def on_registered(self, iface: TMInterface):
-        print("\n>>> Játék motor csatlakoztatva a postafiókhoz! <<<")
+        
+        # --- ÚJ: Képernyőlopó inicializálása ---
+        self.sct = mss.mss()
+        # Beállítjuk, hogy a monitor bal felső sarkából vegyen fel egy 800x600-as részt. 
+        # (Ezt majd a játékod ablakához kell igazítani!)
+        self.monitor = {"top": 30, "left": 0, "width": 800, "height": 600}
 
     def on_checkpoint_count_changed(self, iface: TMInterface, current: int, target: int):
         # ÚJ: ezt a TMInterface automatikusan meghívja, amikor a kocsi
@@ -51,23 +55,28 @@ class TMAIClient(Client):
             speed = state.display_speed
             yaw, pitch, roll = state.yaw_pitch_roll
             vel_x, vel_y, vel_z = state.velocity
-            
-            # --- ÚJ: A POZÍCIÓ KINYERÉSE ---
             pos_x, pos_y, pos_z = state.position
             
-            # 2. A Sebességfokozat (Gear) 
             gear = 1.0 
             if hasattr(state, 'scene_mobil') and hasattr(state.scene_mobil, 'engine'):
                 gear = float(state.scene_mobil.engine.gear)
 
-            # 3. Postafiók küldése (Már 11 adat + 2 jelző!)
+            # --- ÚJ: A JÁTÉK LEFOTÓZÁSA ÉS FELDOLGOZÁSA ---
+            # 1. Képernyőkép készítése
+            img = np.array(self.sct.grab(self.monitor))
+            # 2. Fekete-fehérré alakítás (színek nem kellenek a vezetéshez, csak lassítanák)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+            # 3. Lekicsinyítjük 84x84 pixelre (Ez a szabványos méret az AI-oknál)
+            resized = cv2.resize(gray, (84, 84))
+            # 4. Kicsit átalakítjuk, hogy a hálózat megértse (Magasság, Szélesség, Színcsatorna)
+            image_obs = np.expand_dims(resized, axis=-1)
+
+            # 3. Postafiók küldése (Beletesszük a képet is!)
             if _time >= 0:
-                if state_q.full():
+                while not state_q.empty(): # Agresszív ürítés a fagyás ellen!
                     try: state_q.get_nowait()
                     except: pass
-                # Beletesszük a pos_x, pos_y, pos_z értékeket is a csomagba:
-                state_q.put((speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, self.finished, self.current_cp))
-            
+                state_q.put((speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, self.finished, self.current_cp, image_obs))
             # --- AKCIÓK ---
             try:
                 if _time >= 0:
@@ -105,29 +114,55 @@ class TMAIClient(Client):
 # 2. RÉSZ: AZ AI KÖRNYEZETE (Az Aréna)
 # ==========================================
 class TrackmaniaEnv(gym.Env):
-   def __init__(self):
+    def __init__(self):
         super().__init__()
-        # === ÚJ ACTION SPACE === 
-        # 3 darab érték: [Kormány, Gáz, Fék], mindegyik -1.0 és 1.0 között mozoghat
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
         
-        # === ÚJ OBSERVATION SPACE ===
-        # Megnöveljük 11-re a bemenetek számát (hozzáadtuk a 3 koordinátát)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
+        # === ÚJ MULTIMODÁLIS OBSERVATION SPACE ===
+        self.observation_space = spaces.Dict({
+            # A kamera képe (84x84 fekete-fehér)
+            "image": spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8),
+            # A fizikai adatok (8 darab, A KOORDINÁTÁK NÉLKÜL!)
+            "physics": spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
+        })
         
-        self.max_steps = 10000
+        self.max_steps = 5000
         self.current_step = 0
         self.prev_speed = 0.0
         self.prev_cp = 0 
 
-   def reset(self, seed=None, options=None):
+    def reset(self, seed=None, options=None):
         self.current_step = 0
         gc.collect() 
 
-        while not action_q.empty():
+        while not action_q.empty(): # Agresszív ürítés
             try: action_q.get_nowait()
             except: pass
         action_q.put("RESET")
+   
+        # Kibontjuk az adatokat (kép is jön!)
+        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp, image_obs = state_q.get()
+        
+        # Csomagolás a Dict formátumba (Koordináták nem mennek a hálóba!)
+        physics_obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32)
+        obs = {"image": image_obs, "physics": physics_obs}
+        
+        return obs, {}
+
+    def step(self, action):
+        self.current_step += 1
+        
+        while not action_q.empty():
+            try: action_q.get_nowait()
+            except: pass
+        action_q.put(action)
+        
+        # Kiolvassuk az új adatokat
+        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp, image_obs = state_q.get()
+        
+        # Csomagolás a hálónak
+        physics_obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32)
+        obs = {"image": image_obs, "physics": physics_obs}
    
         # 1. Kibontjuk a megnövelt csomagot
         speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp = state_q.get()
@@ -138,32 +173,23 @@ class TrackmaniaEnv(gym.Env):
         # --- EZ A SOR HIÁNYZOTT! Visszaadjuk az obs-t és egy üres info szótárat ---
         return obs, {}
 
-   def step(self, action):
+    def step(self, action):
         self.current_step += 1
         
-        if action_q.full():
+        while not action_q.empty():
             try: action_q.get_nowait()
             except: pass
         action_q.put(action)
         
-       # Kiolvassuk az új adatokat lépésenként (már a pos_x, pos_y, pos_z is benne van!)
-        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp = state_q.get()
-        obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z], dtype=np.float32)
+        # 1. Kiolvassuk az új adatokat (Már 14 adat jön: 13 + a kép!)
+        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp, image_obs = state_q.get()
+        
+        # 2. Csomagolás a hálónak (Kép + 8 fizikai adat)
+        physics_obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32)
+        obs = {"image": image_obs, "physics": physics_obs}
         
         # -----------------------------------------------------
-        # INNENTŐL A JUTALMAZÁSI RENDSZERED (REWARD) MARAD UGYANAZ!
-        # ... (Ide jön a sebesség jutalom, checkpoint bónusz, fal büntetés stb.) ...
-        # -----------------------------------------------------
-        
-        reward = speed *0.1  # Sebesség jutalom
-        
-        steering_effort = abs(action[0])
-        reward -= steering_effort * 0.05 
-        
-        if steering_effort < 0.1:
-            reward += 1.0
-# -----------------------------------------------------
-        # JUTALMAZÁSI RENDSZER (REWARD) JAVÍTÁSA
+        # JUTALMAZÁSI RENDSZER (REWARD)
         # -----------------------------------------------------
         
         # 1. Alapvető sebesség jutalom (CSAK HA ELŐRE MEGY!)
@@ -193,9 +219,7 @@ class TrackmaniaEnv(gym.Env):
         # 4. Falnak csapódás
         if speed_diff < -15.0:
             reward -= 1000
-            terminated = True # Javítva: Ha falnak csapódik, érjen véget a kör!
-            
-    
+            terminated = True # Ha falnak csapódik, érjen véget a kör!
                 
         # 6. Borulás
         if abs(roll) > 1.5: 
@@ -207,14 +231,9 @@ class TrackmaniaEnv(gym.Env):
             reward -= 1000
             terminated = True
 
-        if  pos_z < 490:
+        if pos_z < 490:
             reward -= 1000
             terminated = True
-            
-        # (A vel_x és vel_y büntetést teljesen töröltük, mert azok térkép-irányok!)
-        
-        # -----------------------------------------------------
-        # INNENTŐL JÖN A FINISHED RÉSZ (Az marad úgy, ahogy volt)
             
         if finished:
             reward += 1000
@@ -225,9 +244,7 @@ class TrackmaniaEnv(gym.Env):
         if self.current_step >= self.max_steps:
             truncated = True
         
-
-
-        
+        # FIGYELEM: Most már csak az új, képpel bővített 'obs'-t adjuk vissza!
         return obs, reward, terminated, truncated, {}
 # ==========================================
 # 3. RÉSZ: A SZÁLAK INDÍTÁSA
@@ -251,8 +268,9 @@ if __name__ == '__main__':
     # ==========================================
     # A) TANÍTÁS MÓD
     # ==========================================
-    print("\n--- NEURÁLIS HÁLÓ INICIALIZÁLÁSA ---")
-    model = PPO("MlpPolicy", env, verbose=1)
+    print("\n--- NEURÁLIS HÁLÓ INICIALIZÁLÁSA (KAMERA + SZENZOROK) ---")
+    # MlpPolicy helyett MultiInputPolicy!
+    model = PPO("MultiInputPolicy", env, verbose=1)
     
     # --- ÚJ: Biztonsági mentés beállítása ---
     # Ez minden 100.000 lépés után csinál egy .zip fájlt a "models" nevű mappába!
