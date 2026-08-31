@@ -3,6 +3,7 @@ from math import fabs
 import time
 import cv2
 import mss
+import math
 import gc
 import torch
 import threading
@@ -21,7 +22,47 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 state_q = queue.Queue(maxsize=1)
 action_q = queue.Queue(maxsize=1)
 
-torch.set_num_threads(4) # Beállítja, hogy a Ryzen 5 7600 mind a 6 magját használja az AI agyának számításaihoz!
+
+torch.set_num_threads(6) # Beállítja, hogy a Ryzen 5 7600 mind a 6 magját használja az AI agyának számításaihoz!
+def get_lidar_distances(gray_img, num_rays=9):
+    """Vizuális LIDAR szimulátor. Kiszámolja a falak távolságát a kép alapján."""
+    h, w = gray_img.shape
+    
+    # 1. Éldetektálás (Megkeressük a vonalakat, útszéleket a képen)
+    edges = cv2.Canny(gray_img, 50, 150)
+    
+    # 2. Az autó pozíciója a képen (Lent, középen)
+    car_x = w // 2
+    car_y = h - 5
+    
+    distances = []
+    # 9 lézersugár 180 fokban (Balról jobbra)
+    angles = np.linspace(180, 0, num_rays)
+    
+    for angle in angles:
+        rad = math.radians(angle)
+        max_dist = 84.0 # A kép mérete a maximális távolság
+        dist = max_dist
+        
+        # Raycasting (Kilőjük a lézert pixelről pixelre)
+        for d in range(5, int(max_dist)): # 5-ről indul, hogy az autót magát ne lássa falnak
+            x = int(car_x + math.cos(rad) * d)
+            y = int(car_y - math.sin(rad) * d)
+            
+            # Ha kiment a képből, az a maximum
+            if x < 0 or x >= w or y < 0 or y >= h:
+                dist = d
+                break
+                
+            # Ha a lézer "falba" (élbe) ütközik az éldetektált képen
+            if edges[y, x] > 0:
+                dist = d
+                break
+                
+        # Normalizáljuk 0.0 és 1.0 közé a távolságot
+        distances.append(dist / max_dist)
+        
+    return np.array(distances, dtype=np.float32)
 # ==========================================
 # 1. RÉSZ: A JÁTÉK MOTORJA (A Test)
 # ==========================================
@@ -60,15 +101,21 @@ class TMAIClient(Client):
             gear = 1.0 
             if hasattr(state, 'scene_mobil') and hasattr(state.scene_mobil, 'engine'):
                 gear = float(state.scene_mobil.engine.gear)
+# --- ÚJ: A JÁTÉK LEFOTÓZÁSA ÉS FELDOLGOZÁSA (GOLYÓÁLLÓ VERZIÓ) ---
+            try:
+                # 1. Képernyőkép készítése
+                img = np.array(self.sct.grab(self.monitor))
+            except Exception as e:
+                # Ha a Windows letiltja a képlopást (pl. letálcázod a játékot)
+                print(f"Képlopási hiba (BitBlt)! Letálcáztad a játékot? Hiba: {e}")
+                # Hogy ne fagyjon le a program, adunk a LIDAR-nak egy tiszta fekete képet ideiglenesen
+                img = np.zeros((self.monitor["height"], self.monitor["width"], 4), dtype=np.uint8)
 
-            # --- ÚJ: A JÁTÉK LEFOTÓZÁSA ÉS FELDOLGOZÁSA ---
-            # 1. Képernyőkép készítése
-            img = np.array(self.sct.grab(self.monitor))
-            # 2. Fekete-fehérré alakítás (színek nem kellenek a vezetéshez, csak lassítanák)
+            # 2. Fekete-fehérré alakítás (színek nem kellenek a vezetéshez)
             gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-            # 3. Lekicsinyítjük 84x84 pixelre (Ez a szabványos méret az AI-oknál)
+            # 3. Lekicsinyítjük 84x84 pixelre
             resized = cv2.resize(gray, (84, 84))
-            # 4. Kicsit átalakítjuk, hogy a hálózat megértse (Magasság, Szélesség, Színcsatorna)
+            # 4. Kicsit átalakítjuk a formátumot
             image_obs = np.expand_dims(resized, axis=-1)
 
             # 3. Postafiók küldése (Beletesszük a képet is!)
@@ -118,13 +165,8 @@ class TrackmaniaEnv(gym.Env):
         super().__init__()
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
         
-        # === ÚJ MULTIMODÁLIS OBSERVATION SPACE ===
-        self.observation_space = spaces.Dict({
-            # A kamera képe (84x84 fekete-fehér)
-            "image": spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8),
-            # A fizikai adatok (8 darab, A KOORDINÁTÁK NÉLKÜL!)
-            "physics": spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
-        })
+        # === ÚJ: 17 adat (8 fizika + 9 LIDAR lézer távolság) ===
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(17,), dtype=np.float32)
         
         self.max_steps = 5000
         self.current_step = 0
@@ -135,17 +177,22 @@ class TrackmaniaEnv(gym.Env):
         self.current_step = 0
         gc.collect() 
 
-        while not action_q.empty(): # Agresszív ürítés
+        while not action_q.empty(): 
             try: action_q.get_nowait()
             except: pass
         action_q.put("RESET")
    
-        # Kibontjuk az adatokat (kép is jön!)
         speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp, image_obs = state_q.get()
         
-        # Csomagolás a Dict formátumba (Koordináták nem mennek a hálóba!)
+        # --- LIDAR FELDOLGOZÁS ---
+        # A kép most már csak a LIDAR-nak kell, az AI már csak a távolságokat kapja!
+        gray_image = image_obs[:, :, 0] # Kivesszük a felesleges dimenziót
+        lidar_data = get_lidar_distances(gray_image)
+        
         physics_obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32)
-        obs = {"image": image_obs, "physics": physics_obs}
+        
+        # Összefűzzük a 8 fizikát és a 9 lézert egyetlen 17-es tömbbé
+        obs = np.concatenate((physics_obs, lidar_data))
         
         return obs, {}
 
@@ -157,47 +204,31 @@ class TrackmaniaEnv(gym.Env):
             except: pass
         action_q.put(action)
         
-        # Kiolvassuk az új adatokat
         speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp, image_obs = state_q.get()
         
-        # Csomagolás a hálónak
+        # --- LIDAR FELDOLGOZÁS ---
+        gray_image = image_obs[:, :, 0]
+        lidar_data = get_lidar_distances(gray_image)
         physics_obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32)
-        obs = {"image": image_obs, "physics": physics_obs}
-   
-        # 1. Kibontjuk a megnövelt csomagot
-        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp = state_q.get()
-        
-        # 2. Beletesszük a 11 adatot a tömbbe, amit az AI megkap
-        obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z], dtype=np.float32)
-        
-        # --- EZ A SOR HIÁNYZOTT! Visszaadjuk az obs-t és egy üres info szótárat ---
-        return obs, {}
-
-    def step(self, action):
-        self.current_step += 1
-        
-        while not action_q.empty():
-            try: action_q.get_nowait()
-            except: pass
-        action_q.put(action)
-        
-        # 1. Kiolvassuk az új adatokat (Már 14 adat jön: 13 + a kép!)
-        speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, finished, current_cp, image_obs = state_q.get()
-        
-        # 2. Csomagolás a hálónak (Kép + 8 fizikai adat)
-        physics_obs = np.array([speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear], dtype=np.float32)
-        obs = {"image": image_obs, "physics": physics_obs}
+        obs = np.concatenate((physics_obs, lidar_data))
+       
         
         # -----------------------------------------------------
         # JUTALMAZÁSI RENDSZER (REWARD)
         # -----------------------------------------------------
         
         # 1. Alapvető sebesség jutalom (CSAK HA ELŐRE MEGY!)
-        if gear > 0:
-            reward = speed * 0.1  # Előre haladásért kap pontot
+        if speed < 2.0: 
+            # Ha meg sem mozdul, vagy beragadt egy falba
+            reward = -50.0  
+        elif gear > 0:
+            # Előre haladásért kap pontot
+            reward = speed * 0.1  
         else:
-            reward = -50.0        # Rükvercért hatalmas folyamatos büntetés jár!
+            # Rükvercért hatalmas folyamatos büntetés jár!
+            reward = -50.0        
 
+        
         # 2. Kormányzás büntetése/jutalmazása
         steering_effort = abs(action[0])
         reward -= steering_effort * 0.05 
@@ -219,8 +250,13 @@ class TrackmaniaEnv(gym.Env):
         # 4. Falnak csapódás
         if speed_diff < -15.0:
             reward -= 1000
-            terminated = True # Ha falnak csapódik, érjen véget a kör!
-                
+           
+         # === 5. FAL SÚROLÁS (Wall Hugging) BÜNTETÉS ===
+        # Ha a bal (0.) vagy jobb (8.) oldali távolság kevesebb, mint 5%, miközben halad
+        if lidar_data[0] < 0.05 or lidar_data[8] < 0.05:
+            if speed > 20.0: # Csak akkor, ha valóban halad és súrolja a falat
+                reward -= 10.0 # Folyamatos, apró áramütések a fal érintéséért 
+            
         # 6. Borulás
         if abs(roll) > 1.5: 
             reward -= 500 
@@ -230,6 +266,8 @@ class TrackmaniaEnv(gym.Env):
         if pos_y < 20.0:
             reward -= 1000
             terminated = True
+
+    
 
         if pos_z < 490:
             reward -= 1000
@@ -266,35 +304,55 @@ if __name__ == '__main__':
     env = TrackmaniaEnv()
     
     # ==========================================
-    # A) TANÍTÁS MÓD
+    # 🌟 A FŐKAPCSOLÓ 🌟
+    # True = Gyors tanítás (Diavetítés, 80+ FPS)
+    # False = Éles Teszt (Szép, sima játékmenet, a már betanult modellel)
     # ==========================================
-    print("\n--- NEURÁLIS HÁLÓ INICIALIZÁLÁSA (KAMERA + SZENZOROK) ---")
-    # MlpPolicy helyett MultiInputPolicy!
-    model = PPO("MultiInputPolicy", env, verbose=1)
-    
-    # --- ÚJ: Biztonsági mentés beállítása ---
-    # Ez minden 100.000 lépés után csinál egy .zip fájlt a "models" nevű mappába!
-    checkpoint_callback = CheckpointCallback(
-        save_freq=100000, 
-        save_path='./models/',
-        name_prefix='tm_ai_model'
-    )
-    
-    
-    # Beadjuk a callback-et a learn függvénynek
-    model.learn(total_timesteps=50000000, callback=checkpoint_callback) 
-    
-    # Ha egyszer majd tényleg végez az 50 millióval, elmenti a végsőt is:
-    model.save("tm_ai_model_final")
-    
-    # ==========================================
-    # B) ÉLES TESZT MÓD (Most ki van kapcsolva a '#' jelekkel)
-    # ==========================================
-    #print("\n--- BETANÍTOTT MODELL BETÖLTÉSE ---")
-    #model = PPO.load("tm_ai_model")
-    #obs, info = env.reset()
-    #while True:
-     # action, _states = model.predict(obs, deterministic=True)
-      #obs, reward, terminated, truncated, info = env.step(action)
-      #if terminated or truncated:
-        #obs, info = env.reset()
+    TRAIN_MODE = True 
+
+    if TRAIN_MODE:
+       
+        print("\n--- NEURÁLIS HÁLÓ TANÍTÁSA (LIDAR SZENZOROKKAL) ---")
+        model = PPO("MlpPolicy", env, verbose=1) # Újra MlpPolicy!
+        
+        checkpoint_callback = CheckpointCallback(
+            save_freq=100000, # 100 ezer lépésenként csinál egy .zip fájlt
+            save_path='./models/',
+            name_prefix='tm_ai_model'
+        )
+        
+        print("Tanítás indul! Ha látni akarod mit tanult, állítsd a TRAIN_MODE-ot False-ra!")
+        model.learn(total_timesteps=50000000, callback=checkpoint_callback) 
+        model.save("tm_ai_model_final")
+        
+    else:
+        print("\n--- ÉLES TESZT MÓD (Látványos vezetés) ---")
+        
+        # IDE ÍRD BE ANNAK A .ZIP FÁJLNAK A NEVÉT, AMIT BE AKARSZ TÖLTENI!
+        # (Nézd meg a 'models' mappádban, mi a legutolsó mentés neve)
+        model_path = "./models/tm_ai_model_800000_steps" 
+        
+        try:
+            model = PPO.load(model_path)
+            print(f"Modell betöltve: {model_path}")
+        except:
+            print("HIBA: Nem található a megadott .zip fájl! Biztosan tanultál már?")
+            exit()
+            
+        obs, info = env.reset()
+        
+        while True:
+            # deterministic=True: Az AI nem kísérletezik véletlenszerűen, 
+            # hanem a lehető legjobb, legbiztosabb tudását használja!
+            action, _states = model.predict(obs, deterministic=True)
+            
+            obs, reward, terminated, truncated, info = env.step(action)
+            
+            # --- A VARÁZSLAT A SZÉP KÉPÉRT ---
+            # Picit megállítjuk a Pythont, hogy a játék motorjának legyen 
+            # ideje renderelni egy szép, sima képkockát (~50 FPS-re lassítjuk)
+            time.sleep(0.02) 
+            
+            if terminated or truncated:
+                print(f"Kör vége! Elért jutalom az utolsó pillanatban: {reward}")
+                obs, info = env.reset()
