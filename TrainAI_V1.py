@@ -34,6 +34,43 @@ def _drain(q: queue.Queue):
 
 
 # ==========================================
+# "NE FAGYJON KI" VÉDELEM
+# ==========================================
+# A TMInterface alapból csak 2 másodpercet ad a kliensnek, hogy válaszoljon egy
+# szerver-hívásra (pl. on_run_step) - ha ez lejár, a szerver MAGÁTÓL leregisztrálja
+# a klienst. Egy reset/respawn körüli pillanatban (gc.collect(), majd az
+# action_q.get(timeout=1.0) várakozás, majd a "press delete" saját szerver-válasz
+# várakozása) ez könnyen összeadódhat 2 másodperc fölé - ILYENKOR tűnik úgy,
+# mintha "lefagyna" a játék, valójában a TMInterface dobta a klienst.
+CLIENT_RESPONSE_TIMEOUT_MS = 30000  # 30 mp - bőven elég egy lassabb reset-hez is; -1 = végtelen várakozás
+
+STATE_WAIT_TIMEOUT_S = 15.0   # ennyi másodpercig várunk egy új állapotra, mielőtt riasztunk/újraküldünk
+STATE_WAIT_MAX_RETRIES = 4    # ennyi próbálkozás után adjuk fel (össz. ~1 perc), és dobunk egy érthető hibát
+
+
+def _wait_for_state(timeout=STATE_WAIT_TIMEOUT_S, max_retries=STATE_WAIT_MAX_RETRIES, on_timeout=None):
+    """Vár egy új állapotra a state_q-ból, `timeout` másodperces türelmi idővel.
+
+    Ha nem jön semmi `timeout` másodperc alatt, kiír egy figyelmeztetést (és ha
+    kaptunk `on_timeout` callback-et - pl. a RESET parancs újraküldésére -, azt is
+    lefuttatja), majd újrapróbálja. `max_retries` sikertelen kör után a korábbi
+    örökös blokkolás helyett egy érthető RuntimeError-t dobunk, hogy tudd, hogy
+    tényleg elakadt valami (nem csak "lefagyottnak tűnik" a szkript)."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return state_q.get(timeout=timeout)
+        except queue.Empty:
+            print(f"⚠️  {timeout:.0f} mp-e nincs új állapot a játéktól ({attempt}/{max_retries}. próbálkozás)...")
+            if on_timeout is not None:
+                on_timeout()
+    raise RuntimeError(
+        "A játék nem küld új állapotot. Valószínűleg leregisztrálódott a TMInterface "
+        "kliens, vagy bezárult/lefagyott a játék. Ellenőrizd, fut-e a TrackMania, és "
+        "hogy a TMInterface be van-e töltve/csatlakoztatva!"
+    )
+
+
+# ==========================================
 # LIDAR - KONSTANSOK ÉS SUGÁRTÁBLA-GYORSÍTÓTÁR
 # ==========================================
 LIDAR_NUM_RAYS = 9
@@ -99,6 +136,12 @@ def get_lidar_distances(gray_img, num_rays=LIDAR_NUM_RAYS):
 # ==========================================
 # 1. RÉSZ: A JÁTÉK MOTORJA (A Test)
 # ==========================================
+
+# --- Tick-időzítés diagnosztikához (lásd on_run_step) ---
+ENABLE_TICK_PROFILING = True       # írjon-e ki periodikusan időzítés-összesítőt
+PROFILE_REPORT_EVERY_N_TICKS = 200  # ennyi valódi (_time >= 0) tick után írjon ki egy összesítést
+
+
 class TMAIClient(Client):
     def __init__(self):
         super().__init__()
@@ -109,7 +152,24 @@ class TMAIClient(Client):
         self.sct = mss.mss()
         # Beállítjuk, hogy a monitor bal felső sarkából vegyen fel egy 800x600-as részt.
         # (Ezt majd a játékod ablakához kell igazítani!)
-        self.monitor = {"top": 30, "left": 0, "width": 800, "height": 600}
+        self.monitor = {"top": 30, "left": 0, "width": 400, "height": 400}
+
+        # --- Tick-időzítés állapota (csak diagnosztikára, nem befolyásol semmilyen döntést) ---
+        self._prof_tick_count = 0
+        self._prof_accum = {"state": 0.0, "screenshot": 0.0, "wait_action": 0.0, "commands": 0.0}
+        self._prof_window_start = time.perf_counter()
+
+    def on_registered(self, iface: TMInterface):
+        # LÁSD FENT: enélkül a TMInterface 2 mp után leregisztrálhat minket egy
+        # lassabb reset/respawn körül, ami "lefagyásnak" tűnik.
+        iface.set_timeout(CLIENT_RESPONSE_TIMEOUT_MS)
+        print(f">>> Kliens regisztrálva. Válasz-timeout: {CLIENT_RESPONSE_TIMEOUT_MS} ms.")
+
+    def on_deregistered(self, iface: TMInterface):
+        # Ha ETTŐL FÜGGETLENÜL mégis leregisztrálódnánk, legalább lássuk azonnal,
+        # ahelyett hogy a szkript némán, magyarázat nélkül lefagyva várna örökké.
+        print("‼️  A TMInterface leregisztrálta ezt a klienst! (nem válaszoltunk időben, "
+              "vagy bezárult a játék) Indítsd újra a szkriptet / csatlakozz újra!")
 
     def on_checkpoint_count_changed(self, iface: TMInterface, current: int, target: int):
         # Ezt a TMInterface automatikusan meghívja, amikor a kocsi
@@ -123,41 +183,55 @@ class TMAIClient(Client):
 
     def on_run_step(self, iface: TMInterface, _time: int):
         try:
-            state = iface.get_simulation_state()
-
-            # 1. Alap adatok
-            speed = state.display_speed
-            yaw, pitch, roll = state.yaw_pitch_roll
-            vel_x, vel_y, vel_z = state.velocity
-            pos_x, pos_y, pos_z = state.position
-
-            gear = 1.0
-            if hasattr(state, 'scene_mobil') and hasattr(state.scene_mobil, 'engine'):
-                gear = float(state.scene_mobil.engine.gear)
-
-            # --- A JÁTÉK LEFOTÓZÁSA ÉS FELDOLGOZÁSA (GOLYÓÁLLÓ VERZIÓ) ---
-            try:
-                # 1. Képernyőkép készítése
-                img = np.array(self.sct.grab(self.monitor))
-            except Exception as e:
-                # Ha a Windows letiltja a képlopást (pl. letálcázod a játékot)
-                print(f"Képlopási hiba (BitBlt)! Letálcáztad a játékot? Hiba: {e}")
-                # Hogy ne fagyjon le a program, adunk a LIDAR-nak egy tiszta fekete képet ideiglenesen
-                img = np.zeros((self.monitor["height"], self.monitor["width"], 4), dtype=np.uint8)
-
-            # 2. Fekete-fehérré alakítás (színek nem kellenek a vezetéshez)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-            # 3. Lekicsinyítjük 84x84 pixelre
-            resized = cv2.resize(gray, (84, 84))
-            # 4. Kicsit átalakítjuk a formátumot
-            image_obs = np.expand_dims(resized, axis=-1)
-
-            # 3. Postafiók küldése (Beletesszük a képet is!)
+            # A kör indulása előtti visszaszámlálás alatt (_time < 0, amíg a kocsi
+            # még nem lépett le a start mezőről) ez az adatgyűjtés régebben MINDIG
+            # lefutott, pedig az eredménye ilyenkor sosem ment sehova (lásd lentebb:
+            # csak _time >= 0 esetén kerül a postafiókba). A visszaszámlálás alatt
+            # viszont a run-step-ek jóval sűrűbben jöhetnek, és minden egyes ilyen
+            # tick-nél lefutó szerver-kérés + képernyőkép + OpenCV feldolgozás simán
+            # le tudja terhelni annyira a gépet, hogy a játék pár másodpercre
+            # "diavetítésszerűvé" váljon - pontosan ez volt a jelenség. Ezért mostantól
+            # csak akkor gyűjtjük össze/dolgozzuk fel az adatokat, ha ténylegesen el is
+            # küldjük a postafiókba.
             if _time >= 0:
+                t_state_start = time.perf_counter()
+                state = iface.get_simulation_state()
+
+                # 1. Alap adatok
+                speed = state.display_speed
+                yaw, pitch, roll = state.yaw_pitch_roll
+                vel_x, vel_y, vel_z = state.velocity
+                pos_x, pos_y, pos_z = state.position
+
+                gear = 1.0
+                if hasattr(state, 'scene_mobil') and hasattr(state.scene_mobil, 'engine'):
+                    gear = float(state.scene_mobil.engine.gear)
+                t_state_end = time.perf_counter()
+
+                # --- A JÁTÉK LEFOTÓZÁSA ÉS FELDOLGOZÁSA (GOLYÓÁLLÓ VERZIÓ) ---
+                try:
+                    # 1. Képernyőkép készítése
+                    img = np.array(self.sct.grab(self.monitor))
+                except Exception as e:
+                    # Ha a Windows letiltja a képlopást (pl. letálcázod a játékot)
+                    print(f"Képlopási hiba (BitBlt)! Letálcáztad a játékot? Hiba: {e}")
+                    # Hogy ne fagyjon le a program, adunk a LIDAR-nak egy tiszta fekete képet ideiglenesen
+                    img = np.zeros((self.monitor["height"], self.monitor["width"], 4), dtype=np.uint8)
+
+                # 2. Fekete-fehérré alakítás (színek nem kellenek a vezetéshez)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+                # 3. Lekicsinyítjük 84x84 pixelre
+                resized = cv2.resize(gray, (84, 84))
+                # 4. Kicsit átalakítjuk a formátumot
+                image_obs = np.expand_dims(resized, axis=-1)
+                t_screenshot_end = time.perf_counter()
+
+                # 3. Postafiók küldése (Beletesszük a képet is!)
                 _drain(state_q)  # Agresszív ürítés a fagyás ellen!
                 state_q.put((speed, yaw, pitch, roll, vel_x, vel_y, vel_z, gear, pos_x, pos_y, pos_z, self.finished, self.current_cp, image_obs))
 
             # --- AKCIÓK ---
+            t_action_wait_start = time.perf_counter()
             try:
                 if _time >= 0:
                     action = action_q.get(timeout=1.0)
@@ -165,6 +239,7 @@ class TMAIClient(Client):
                     action = action_q.get_nowait()
             except queue.Empty:
                 action = None
+            t_action_wait_end = time.perf_counter()
 
             # --- VÉGREHAJTÁS ---
             if isinstance(action, str) and action == "RESET":
@@ -186,6 +261,34 @@ class TMAIClient(Client):
                 else:
                     # Üresjárat (Nincs pedál lenyomva)
                     iface.execute_command("gas 0")
+            t_commands_end = time.perf_counter()
+
+            # --- TICK-IDŐZÍTÉS (csak diagnosztika, semmilyen döntést nem befolyásol) ---
+            # Ez megmutatja, hogy egy valódi (_time >= 0) tick-en belül mennyi idő megy el
+            # state lekérésre, screenshot+feldolgozásra, az akcióra várakozásra (ez utóbbi
+            # nagyrészt a tanító szál/PPO oldali munkát takarja!), illetve a parancsok
+            # elküldésére. Ha 2x sebességnél megint "PPT"-t kapsz, ez az összesítő elárulja,
+            # melyik fázis a szűk keresztmetszet a te gépeden.
+            if ENABLE_TICK_PROFILING and _time >= 0:
+                self._prof_accum["state"] += (t_state_end - t_state_start)
+                self._prof_accum["screenshot"] += (t_screenshot_end - t_state_end)
+                self._prof_accum["wait_action"] += (t_action_wait_end - t_action_wait_start)
+                self._prof_accum["commands"] += (t_commands_end - t_action_wait_end)
+                self._prof_tick_count += 1
+
+                if self._prof_tick_count >= PROFILE_REPORT_EVERY_N_TICKS:
+                    n = self._prof_tick_count
+                    elapsed = time.perf_counter() - self._prof_window_start
+                    print(
+                        f"⏱️  {n} tick / {elapsed:.2f}s  =>  {n / elapsed:.1f} tick/mp   |   "
+                        f"átlag/tick — state: {self._prof_accum['state'] / n * 1000:.1f}ms, "
+                        f"screenshot: {self._prof_accum['screenshot'] / n * 1000:.1f}ms, "
+                        f"akcióra várás: {self._prof_accum['wait_action'] / n * 1000:.1f}ms, "
+                        f"parancsok: {self._prof_accum['commands'] / n * 1000:.1f}ms"
+                    )
+                    self._prof_accum = {k: 0.0 for k in self._prof_accum}
+                    self._prof_tick_count = 0
+                    self._prof_window_start = time.perf_counter()
 
         except Exception as e:
             print(f"--- VÉGZETES HIBA A JÁTÉK SZÁLBAN: {e} ---")
@@ -221,6 +324,8 @@ MIN_TRACK_POS_Z = 490.0
 
 FINISH_BONUS = 1000.0
 
+GC_COLLECT_EVERY_N_RESETS = 20  # ne minden reset-nél fussunk teljes gc.collect()-et (lásd lentebb, miért)
+
 
 class TrackmaniaEnv(gym.Env):
     def __init__(self):
@@ -234,6 +339,7 @@ class TrackmaniaEnv(gym.Env):
         self.current_step = 0
         self.prev_speed = 0.0
         self.prev_cp = 0
+        self._reset_count = 0
 
     @staticmethod
     def _build_observation(state):
@@ -257,12 +363,23 @@ class TrackmaniaEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         self.current_step = 0
-        gc.collect()
 
-        _drain(action_q)
-        action_q.put("RESET")
+        # gc.collect() egy teljes generációs GC-t kényszerít ki - ez pont a
+        # timeout-érzékeny reset-pillanatban simán elvehet 100+ ms-ot feleslegesen.
+        # Python automatikus GC-je enélkül is fut folyamatosan, úgyhogy elég csak
+        # időnként (nem MINDEN reset-nél) lefuttatni egy teljeset.
+        self._reset_count += 1
+        if self._reset_count % GC_COLLECT_EVERY_N_RESETS == 0:
+            gc.collect()
 
-        obs, *_ = self._build_observation(state_q.get())
+        def resend_reset():
+            _drain(action_q)
+            action_q.put("RESET")
+
+        resend_reset()
+        state = _wait_for_state(on_timeout=resend_reset)
+
+        obs, *_ = self._build_observation(state)
         return obs, {}
 
     def step(self, action):
@@ -271,7 +388,8 @@ class TrackmaniaEnv(gym.Env):
         _drain(action_q)
         action_q.put(action)
 
-        obs, speed, roll, gear, lidar_data, pos_y, pos_z, finished, current_cp = self._build_observation(state_q.get())
+        state = _wait_for_state()
+        obs, speed, roll, gear, lidar_data, pos_y, pos_z, finished, current_cp = self._build_observation(state)
 
         # -----------------------------------------------------
         # JUTALMAZÁSI RENDSZER (REWARD)
